@@ -34,21 +34,28 @@ class ReplayBuffer:
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
 
-    def sample(self, batch_size: int) -> Transition:
-        idx = jax.random.randint(jax.random.PRNGKey(0), (self.n_env, batch_size), 0, self.size - self.n_steps)
+    def sample(self, rng: jax.random.PRNGKey, batch_size: int) -> Transition:
+        idx = jax.random.randint(rng, (self.n_env, batch_size), 0, self.size - self.n_steps)
         steps = jnp.arange(self.n_steps)[None, None, :]
         all_idx = (idx[..., None] + steps) % self.max_size  # [env, B, n_step]
 
-        rewards = jnp.take_along_axis(self.reward, all_idx, axis=1)  # [env, B, n_step]
-        dones = jnp.take_along_axis(self.done, all_idx, axis=1)
+        rewards = jnp.take_along_axis(self.reward[..., None], all_idx, axis=1)
+        dones = jnp.take_along_axis(self.done[..., None], all_idx, axis=1)
 
         mask = jnp.cumprod(1.0 - jnp.pad(dones[..., :-1], ((0, 0), (0, 0), (1, 0))), axis=-1)
         discounted = rewards * (mask * self.gamma ** steps)
         returns = discounted.sum(-1)
 
-        next_idx = jnp.take_along_axis(all_idx, jnp.argmin((dones > 0), axis=-1, keepdims=True), axis=-1).squeeze(-1)
-        no_done = dones.sum(-1) == 0
-        next_idx = jnp.where(no_done, all_idx[..., -1], next_idx)
+        done_anywhere = dones.any(-1)
+        first_done_idx = jnp.argmax(dones, axis=-1)
+        fallback_idx = all_idx[..., -1]
+        flat_env = jnp.arange(self.n_env)[:, None]
+        flat_batch = jnp.arange(batch_size)[None, :]
+        next_idx = jnp.where(
+            done_anywhere,
+            all_idx[flat_env, flat_batch, first_done_idx],
+            fallback_idx,
+        )
 
         obs = jnp.take_along_axis(self.obs, idx[..., None], axis=1).reshape(-1, self.obs.shape[-1])
         act = jnp.take_along_axis(self.action, idx[..., None], axis=1).reshape(-1, self.action.shape[-1])

@@ -1,9 +1,9 @@
-from ast import Tuple
-from flax.train_state import TrainState
+from typing import Tuple, Callable
+from flax.training.train_state import TrainState
 import flax.linen as nn
-from typing import Callable
 import jax.numpy as jnp
 import jax
+import optax
 
 class DistributionalQNetwork(nn.Module):
     obs_dim: int
@@ -55,14 +55,15 @@ class Critic(nn.Module):
             v_min=self.v_min,
             v_max=self.v_max,
         )
+        # Cache support for efficiency
+        self.support = jnp.linspace(self.v_min, self.v_max, self.num_atoms)
 
     def __call__(self, obs: jnp.ndarray, act: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:  # noqa: F821
         return self.qnet1(obs, act), self.qnet2(obs, act)
 
     def value(self, logits: jnp.ndarray) -> jnp.ndarray:
-        support = jnp.linspace(self.v_min, self.v_max, self.num_atoms)
         probs = nn.softmax(logits, axis=-1)
-        return jnp.sum(probs * support, axis=-1)
+        return jnp.sum(probs * self.support, axis=-1)
 
 class Actor(nn.Module):
     obs_dim: int
@@ -136,15 +137,21 @@ class TD3:
             critic_def.v_min, critic_def.v_max, critic_def.num_atoms
         )
 
-    def select_action(self, obs):
+    def select_action(self, obs, add_noise=False):
         obs = jnp.asarray(obs)
         action = self.actor.apply_fn(self.actor.params, obs)
+        
+        if add_noise:
+            self.rng, noise_key = jax.random.split(self.rng)
+            noise = jax.random.normal(noise_key, action.shape) * 0.1 * self.max_action
+            action = action + noise
+            
         return jnp.clip(action, -self.max_action, self.max_action)
 
     def train(self, replay_buffer, batch_size):
         self.total_it += 1
-        batch = replay_buffer.sample(batch_size)
-        self.rng, noise_key = jax.random.split(self.rng)
+        self.rng, sample_key, noise_key = jax.random.split(self.rng, 3)
+        batch = replay_buffer.sample(sample_key, batch_size)
 
         def value_from_logits(logits):
             probs = nn.softmax(logits, axis=-1)
@@ -169,7 +176,7 @@ class TD3:
             target_q1 = value_from_logits(target_q1_logits)
             target_q2 = value_from_logits(target_q2_logits)
             target_q = jnp.minimum(target_q1, target_q2)
-            target_q = batch.reward + (1.0 - batch.done) * self.discount * target_q
+            target_q = batch.reward + (1.0 - batch.done) * (self.discount ** batch.effective_n) * target_q
 
             q1_logits, q2_logits = self.critic.apply_fn(
                 critic_params, batch.obs, batch.action
