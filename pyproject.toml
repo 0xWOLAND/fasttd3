@@ -8,6 +8,7 @@ dependencies = [
     "brax>=0.12.4",
     "flax>=0.10.7",
     "gymnasium>=1.2.0",
+    "imageio>=2.37.0",
     "jax>=0.6.2",
     "jaxlib>=0.6.2",
     "optax>=0.2.5",
