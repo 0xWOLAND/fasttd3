@@ -93,6 +93,20 @@ def train_agent(args):
             avg_reward = np.mean(recent_rewards) if recent_rewards else episode_reward
             print(f"Episode {episode_num + 1}: Reward: {episode_reward:.2f}, Avg({len(recent_rewards)}): {avg_reward:.2f}")
             
+            # Checkpoint every 100 episodes
+            if episode_num % 100 == 0:
+                model_data = {
+                    'actor_params': agent.actor.params,
+                    'critic_params': agent.critic.params,
+                    'actor_def': actor_def,
+                    'critic_def': critic_def,
+                    'max_action': max_action,
+                    'obs_dim': obs_dim,
+                    'act_dim': act_dim
+                }
+                with open(args.save_model, 'wb') as f:
+                    pickle.dump(model_data, f)
+            
             # Check if solved
             if len(recent_rewards) >= args.eval_window and avg_reward >= args.solve_threshold:
                 print(f"Environment solved! Average reward {avg_reward:.2f} >= {args.solve_threshold}")
