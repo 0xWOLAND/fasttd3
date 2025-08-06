@@ -35,32 +35,16 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.max_size)
 
     def sample(self, rng: jax.random.PRNGKey, batch_size: int) -> Transition:
-        idx = jax.random.randint(rng, (self.n_env, batch_size), 0, self.size - self.n_steps)
-        steps = jnp.arange(self.n_steps)[None, None, :]
-        all_idx = (idx[..., None] + steps) % self.max_size  # [env, B, n_step]
+        # Sample from flattened buffer like FastTD3
+        total_samples = self.n_env * self.size
+        flat_idx = jax.random.randint(rng, (batch_size,), 0, total_samples)
+        env_idx = flat_idx // self.size
+        buffer_idx = flat_idx % self.size
 
-        rewards = jnp.take_along_axis(self.reward[..., None], all_idx, axis=1)
-        dones = jnp.take_along_axis(self.done[..., None], all_idx, axis=1)
+        obs = self.obs[env_idx, buffer_idx]
+        act = self.action[env_idx, buffer_idx]
+        next_obs = self.next_obs[env_idx, buffer_idx]
+        reward = self.reward[env_idx, buffer_idx]
+        done = self.done[env_idx, buffer_idx]
 
-        mask = jnp.cumprod(1.0 - jnp.pad(dones[..., :-1], ((0, 0), (0, 0), (1, 0))), axis=-1)
-        discounted = rewards * (mask * self.gamma ** steps)
-        returns = discounted.sum(-1)
-
-        done_anywhere = dones.any(-1)
-        first_done_idx = jnp.argmax(dones, axis=-1)
-        fallback_idx = all_idx[..., -1]
-        flat_env = jnp.arange(self.n_env)[:, None]
-        flat_batch = jnp.arange(batch_size)[None, :]
-        next_idx = jnp.where(
-            done_anywhere,
-            all_idx[flat_env, flat_batch, first_done_idx],
-            fallback_idx,
-        )
-
-        obs = jnp.take_along_axis(self.obs, idx[..., None], axis=1).reshape(-1, self.obs.shape[-1])
-        act = jnp.take_along_axis(self.action, idx[..., None], axis=1).reshape(-1, self.action.shape[-1])
-        next_obs = jnp.take_along_axis(self.next_obs, next_idx[..., None], axis=1).reshape(-1, self.obs.shape[-1])
-        dones = jnp.take_along_axis(self.done, next_idx, axis=1).reshape(-1)
-        effective_n = mask.sum(-1).reshape(-1)
-
-        return Transition(obs, act, next_obs, returns.reshape(-1), dones, effective_n)
+        return Transition(obs, act, next_obs, reward, done, jnp.ones_like(reward))

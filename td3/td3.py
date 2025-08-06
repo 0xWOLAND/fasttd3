@@ -91,8 +91,8 @@ class TD3:
         actor_lr=3e-4,
         critic_lr=3e-4,
         discount=0.99,
-        tau=0.005,
-        policy_noise=0.2,
+        tau=0.1,
+        policy_noise=0.001,
         noise_clip=0.5,
         policy_freq=2,
         seed=0,
@@ -143,7 +143,7 @@ class TD3:
         
         if add_noise:
             self.rng, noise_key = jax.random.split(self.rng)
-            noise = jax.random.normal(noise_key, action.shape) * 0.1 * self.max_action
+            noise = jax.random.normal(noise_key, action.shape) * 0.4 * self.max_action  # Use expl_noise
             action = action + noise
             
         return jnp.clip(action, -self.max_action, self.max_action)
@@ -173,18 +173,50 @@ class TD3:
             target_q1_logits, target_q2_logits = self.critic_target.apply_fn(
                 self.critic_target.params, batch.next_obs, next_action
             )
-            target_q1 = value_from_logits(target_q1_logits)
-            target_q2 = value_from_logits(target_q2_logits)
-            target_q = jnp.minimum(target_q1, target_q2)
-            target_q = batch.reward + (1.0 - batch.done) * (self.discount ** batch.effective_n) * target_q
+            target_q1_probs = nn.softmax(target_q1_logits, axis=-1)
+            target_q2_probs = nn.softmax(target_q2_logits, axis=-1)
+            
+            # Choose min Q distribution (Clipped Double Q-learning)
+            target_q1_vals = jnp.sum(target_q1_probs * self.support, axis=-1, keepdims=True)
+            target_q2_vals = jnp.sum(target_q2_probs * self.support, axis=-1, keepdims=True)
+            target_probs = jnp.where(target_q1_vals < target_q2_vals, target_q1_probs, target_q2_probs)
+            
+            # Distributional projection
+            delta_z = (self.critic_def.v_max - self.critic_def.v_min) / (self.critic_def.num_atoms - 1)
+            target_z = batch.reward[:, None] + (1.0 - batch.done[:, None]) * (self.discount ** batch.effective_n)[:, None] * self.support[None, :]
+            target_z = jnp.clip(target_z, self.critic_def.v_min, self.critic_def.v_max)
+            b = (target_z - self.critic_def.v_min) / delta_z
+            l = jnp.floor(b).astype(jnp.int32)
+            u = jnp.ceil(b).astype(jnp.int32)
+            
+            # Handle boundary conditions
+            l_mask = (u > 0) & (l == u)
+            u_mask = (l < (self.critic_def.num_atoms - 1)) & (l == u)
+            l = jnp.where(l_mask, l - 1, l)
+            u = jnp.where(u_mask, u + 1, u)
+            
+            # Simplified distributional projection - vectorized
+            batch_size, num_atoms = target_probs.shape
+            l = jnp.clip(l, 0, num_atoms - 1)
+            u = jnp.clip(u, 0, num_atoms - 1)
+            
+            # Vectorized projection using scatter_add
+            indices = jnp.arange(batch_size)[:, None, None] * num_atoms + l[:, :, None]  
+            weights_l = target_probs[:, :, None] * (u.astype(jnp.float32)[:, :, None] - b[:, :, None])
+            
+            indices_u = jnp.arange(batch_size)[:, None, None] * num_atoms + u[:, :, None]
+            weights_u = target_probs[:, :, None] * (b[:, :, None] - l.astype(jnp.float32)[:, :, None])
+            
+            target_dist_flat = jnp.zeros(batch_size * num_atoms)
+            target_dist_flat = target_dist_flat.at[indices.flatten()].add(weights_l.flatten())
+            target_dist_flat = target_dist_flat.at[indices_u.flatten()].add(weights_u.flatten())
+            target_dist = target_dist_flat.reshape(batch_size, num_atoms)
 
             q1_logits, q2_logits = self.critic.apply_fn(
                 critic_params, batch.obs, batch.action
             )
-            q1 = value_from_logits(q1_logits)
-            q2 = value_from_logits(q2_logits)
-
-            loss = ((q1 - target_q) ** 2 + (q2 - target_q) ** 2).mean()
+            
+            loss = -(target_dist * nn.log_softmax(q1_logits, axis=-1)).sum(-1).mean() - (target_dist * nn.log_softmax(q2_logits, axis=-1)).sum(-1).mean()
             return loss
 
         critic_grads = jax.grad(critic_loss_fn)(self.critic.params)
@@ -192,6 +224,7 @@ class TD3:
 
         if self.total_it % self.policy_freq == 0:
 
+            @jax.jit
             def actor_loss_fn(actor_params):
                 actions = self.actor.apply_fn(actor_params, batch.obs)
                 q1_logits, _ = self.critic.apply_fn(

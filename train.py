@@ -1,101 +1,80 @@
 import gymnasium as gym
-import jax.numpy as jnp
 import numpy as np
 from td3.td3 import TD3, Actor, Critic
 from td3.utils import ReplayBuffer
-import jax
 
-def eval_policy(agent, env_name, seed, eval_episodes=10):
-    eval_env = gym.make(env_name)
-    
-    avg_reward = 0.
+def eval_policy(agent, seed, eval_episodes=5):
+    eval_env = gym.make("Humanoid-v4")
+    rewards = []
     for _ in range(eval_episodes):
         obs, _ = eval_env.reset(seed=seed + 100)
-        episode_reward = 0
-        done = False
+        episode_reward, done = 0, False
         while not done:
             action = np.asarray(agent.select_action(obs[None]))[0]
             obs, reward, terminated, truncated, _ = eval_env.step(action)
             episode_reward += reward
             done = terminated or truncated
-        avg_reward += episode_reward
-    
-    avg_reward /= eval_episodes
-    print(f"Evaluation over {eval_episodes} episodes: {avg_reward:.3f}")
+        rewards.append(episode_reward)
+    avg_reward = np.mean(rewards)
+    print(f"Evaluation: {avg_reward:.1f}")
     return avg_reward
 
-# Create vectorized environments
-num_envs = 128
-envs = gym.make_vec("Pendulum-v1", num_envs=num_envs)
-env = gym.make("Pendulum-v1")  # Single env for reference
-obs_dim = env.observation_space.shape[0]
-act_dim = env.action_space.shape[0]
-max_action = float(env.action_space.high[0])
+num_envs, max_timesteps, eval_freq = 32, 50000, 5000
+learning_starts, batch_size, buffer_size = 10, 4096, 8192
+gamma, lr, expl_noise = 0.99, 3e-4, 0.4
 
-agent = TD3(
-    state_dim=obs_dim,
-    action_dim=act_dim,
-    max_action=max_action,
-    actor_def=Actor(obs_dim, act_dim, max_action, hidden_dim=256),
-    critic_def=Critic(obs_dim, act_dim, num_atoms=51, hidden_dim=256, v_min=-10, v_max=10),
-    num_envs=128,
-)
+# Setup
+envs = gym.make_vec("Humanoid-v4", num_envs=num_envs)
+obs_dim, act_dim = envs.single_observation_space.shape[0], envs.single_action_space.shape[0]
+max_action = float(envs.single_action_space.high[0])
 
-rb = ReplayBuffer(obs_dim, act_dim, size=100_000, n_env=128, n_steps=1, gamma=0.99)
+agent = TD3(obs_dim, act_dim, max_action, 
+           Actor(obs_dim, act_dim, max_action, hidden_dim=512),
+           Critic(obs_dim, act_dim, num_atoms=101, hidden_dim=1024, v_min=-250, v_max=250), num_envs)
 
-# Training parameters optimized for vectorized training
-start_timesteps = 5000  # Reduced for faster learning with 128 envs
-eval_freq = 5000  # How often (time steps) we evaluate
-max_timesteps = 100000  # Reduced for faster testing
-expl_noise = 0.1  # Std of Gaussian exploration noise
-batch_size = 256  # Batch size for both actor and critic
-seed = 0
+rb = ReplayBuffer(obs_dim, act_dim, buffer_size, num_envs, 1, gamma)
+evaluations = [eval_policy(agent, 0)]
 
-# Evaluate untrained policy
-evaluations = [eval_policy(agent, "Pendulum-v1", seed)]
-
-obs, _ = envs.reset()  # Shape: [num_envs, obs_dim]
+obs, _ = envs.reset()
 episode_rewards = np.zeros(num_envs)
-episode_timesteps = np.zeros(num_envs)
-episode_num = 0
+recent_rewards = []
 
 for t in range(max_timesteps):
-    episode_timesteps += 1
-    
-    # Select actions for all environments
-    if t < start_timesteps:
-        actions = np.array([envs.single_action_space.sample() for _ in range(num_envs)])
-    else:
-        actions = np.asarray(agent.select_action(obs, add_noise=True))
+    actions = (np.array([envs.single_action_space.sample() for _ in range(num_envs)]) 
+              if t < learning_starts else np.asarray(agent.select_action(obs, add_noise=True)))
     
     next_obs, rewards, terminated, truncated, _ = envs.step(actions)
     dones = terminated | truncated
     episode_rewards += rewards
     
-    # Handle episode termination vs truncation for proper done_bool
-    done_bools = terminated.astype(float)
+    rb.add(obs, actions, next_obs, rewards, terminated.astype(float))
     
-    rb.add(obs, actions, next_obs, rewards, done_bools)
-    
-    # Reset environments that are done
+    # Track completed episodes with running statistics
     if np.any(dones):
-        finished_episodes = np.where(dones)[0]
-        for env_idx in finished_episodes:
-            print(f"Total T: {t+1} Env: {env_idx} Episode T: {episode_timesteps[env_idx]} Reward: {episode_rewards[env_idx]:.3f}")
-            episode_rewards[env_idx] = 0
-            episode_timesteps[env_idx] = 0
-            episode_num += 1
+        finished_rewards = episode_rewards[dones]
+        recent_rewards.extend(finished_rewards)
+        recent_rewards = recent_rewards[-200:]  # Keep last 200 episodes
+        
+        if len(recent_rewards) >= 10 and len(recent_rewards) % 20 == 0:  # Print every 20 episodes
+            avg_recent = np.mean(recent_rewards[-50:]) if len(recent_rewards) >= 50 else np.mean(recent_rewards)
+            best_recent = np.max(recent_rewards[-50:]) if len(recent_rewards) >= 50 else np.max(recent_rewards)
+            worst_recent = np.min(recent_rewards[-50:]) if len(recent_rewards) >= 50 else np.min(recent_rewards)
+            print(f"T: {t+1:5d} | Episodes: {len(recent_rewards):3d} | Avg(50): {avg_recent:7.1f} | Best(50): {best_recent:7.1f} | Worst(50): {worst_recent:7.1f}")
+        
+        episode_rewards[dones] = 0
     
     obs = next_obs
+    if t >= learning_starts: 
+        agent.train(rb, batch_size)
+        # Debug: print loss occasionally
+        if t % 1000 == 0:
+            print(f"Debug: Step {t}, total_it={agent.total_it}")
+    if (t + 1) % eval_freq == 0: 
+        evaluations.append(eval_policy(agent, 0))
+        # Save checkpoint
+        import pickle
+        with open(f"checkpoint_{t+1}.pkl", "wb") as f:
+            pickle.dump({"actor_params": agent.actor.params, "critic_params": agent.critic.params}, f)
 
-    # Train agent after collecting sufficient data
-    if t >= start_timesteps:
-        agent.train(rb, batch_size=batch_size)
-    
-    # Evaluate episode
-    if (t + 1) % eval_freq == 0:
-        avg_reward = eval_policy(agent, "Pendulum-v1", seed)
-        evaluations.append(avg_reward)
-
-print(f"\nFinal evaluations: {evaluations}")
-print(f"Average improvement: {evaluations[-1] - evaluations[0]:.3f}")
+print(f"Final: {evaluations}")
+print(f"Improvement: {evaluations[-1] - evaluations[0]:.3f}")

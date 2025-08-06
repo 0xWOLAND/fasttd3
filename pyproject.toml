@@ -7,8 +7,8 @@ requires-python = ">=3.11"
 dependencies = [
     "brax>=0.12.4",
     "flax>=0.10.7",
-    "gymnasium>=1.2.0",
-    "jax>=0.6.2",
+    "gymnasium[mujoco]>=1.2.0",
+    "jax[cuda12]>=0.6.2",
     "jaxlib>=0.6.2",
     "optax>=0.2.5",
 ]
