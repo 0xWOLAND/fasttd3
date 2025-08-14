@@ -75,7 +75,8 @@ class Actor(nn.Module):
     @nn.compact
     def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
         x = self.activation(nn.Dense(self.hidden_dim)(obs))
-        x = self.activation(nn.Dense(self.hidden_dim)(x))
+        x = self.activation(nn.Dense(self.hidden_dim // 2)(x))
+        x = self.activation(nn.Dense(self.hidden_dim // 4)(x))
         x = nn.Dense(self.act_dim)(x)
         return self.max_action * jnp.tanh(x)
 
@@ -95,6 +96,7 @@ class TD3:
         policy_noise=0.001,
         noise_clip=0.5,
         policy_freq=2,
+        expl_noise=0.001,
         seed=0,
     ):
         self.max_action = max_action
@@ -103,6 +105,7 @@ class TD3:
         self.policy_noise = policy_noise
         self.noise_clip = noise_clip
         self.policy_freq = policy_freq
+        self.expl_noise = expl_noise
         self.total_it = 0
         self.num_envs = num_envs
 
@@ -136,6 +139,10 @@ class TD3:
         self.support = jnp.linspace(
             critic_def.v_min, critic_def.v_max, critic_def.num_atoms
         )
+        
+        # Store initial learning rates for scheduling
+        self.initial_actor_lr = actor_lr
+        self.initial_critic_lr = critic_lr
 
     def select_action(self, obs, add_noise=False):
         obs = jnp.asarray(obs)
@@ -143,15 +150,25 @@ class TD3:
         
         if add_noise:
             self.rng, noise_key = jax.random.split(self.rng)
-            noise = jax.random.normal(noise_key, action.shape) * 0.4 * self.max_action  # Use expl_noise
+            noise = jax.random.normal(noise_key, action.shape) * self.expl_noise * self.max_action
             action = action + noise
             
         return jnp.clip(action, -self.max_action, self.max_action)
 
+    def train_batch(self, batch):
+        """Train on a pre-sampled and pre-processed batch"""
+        self.total_it += 1
+        self.rng, noise_key = jax.random.split(self.rng)
+        self._train_on_batch(batch, noise_key)
+        
     def train(self, replay_buffer, batch_size):
+        """Original train method for backward compatibility"""
         self.total_it += 1
         self.rng, sample_key, noise_key = jax.random.split(self.rng, 3)
         batch = replay_buffer.sample(sample_key, batch_size)
+        self._train_on_batch(batch, noise_key)
+        
+    def _train_on_batch(self, batch, noise_key):
 
         def value_from_logits(logits):
             probs = nn.softmax(logits, axis=-1)
@@ -181,36 +198,44 @@ class TD3:
             target_q2_vals = jnp.sum(target_q2_probs * self.support, axis=-1, keepdims=True)
             target_probs = jnp.where(target_q1_vals < target_q2_vals, target_q1_probs, target_q2_probs)
             
-            # Distributional projection
+            # Distributional projection (exact FastTD3 implementation)
             delta_z = (self.critic_def.v_max - self.critic_def.v_min) / (self.critic_def.num_atoms - 1)
-            target_z = batch.reward[:, None] + (1.0 - batch.done[:, None]) * (self.discount ** batch.effective_n)[:, None] * self.support[None, :]
-            target_z = jnp.clip(target_z, self.critic_def.v_min, self.critic_def.v_max)
-            b = (target_z - self.critic_def.v_min) / delta_z
-            l = jnp.floor(b).astype(jnp.int32)
-            u = jnp.ceil(b).astype(jnp.int32)
+            batch_size = batch.reward.shape[0]
             
-            # Handle boundary conditions
+            # Compute target distribution support points with proper effective_n discounting  
+            effective_discount = self.discount ** batch.effective_n[:, None]
+            target_z = batch.reward[:, None] + (1.0 - batch.done[:, None]) * effective_discount * self.support[None, :]
+            target_z = jnp.clip(target_z, self.critic_def.v_min, self.critic_def.v_max)
+            
+            # Map target values to atom indices  
+            b = (target_z - self.critic_def.v_min) / delta_z
+            l = jnp.floor(b).astype(jnp.int32)  # Lower bound indices
+            u = jnp.ceil(b).astype(jnp.int32)   # Upper bound indices
+            
+            # Handle edge cases for boundary atoms
             l_mask = (u > 0) & (l == u)
             u_mask = (l < (self.critic_def.num_atoms - 1)) & (l == u)
             l = jnp.where(l_mask, l - 1, l)
             u = jnp.where(u_mask, u + 1, u)
             
-            # Simplified distributional projection - vectorized
-            batch_size, num_atoms = target_probs.shape
-            l = jnp.clip(l, 0, num_atoms - 1)
-            u = jnp.clip(u, 0, num_atoms - 1)
+            # Initialize projected distribution
+            target_dist = jnp.zeros_like(target_probs)
             
-            # Vectorized projection using scatter_add
-            indices = jnp.arange(batch_size)[:, None, None] * num_atoms + l[:, :, None]  
-            weights_l = target_probs[:, :, None] * (u.astype(jnp.float32)[:, :, None] - b[:, :, None])
+            # Create offset for vectorized batch indexing
+            offset = jnp.linspace(0, (batch_size - 1) * self.critic_def.num_atoms, 
+                                 batch_size, dtype=jnp.int32)[:, None]
+            offset = jnp.broadcast_to(offset, (batch_size, self.critic_def.num_atoms))
             
-            indices_u = jnp.arange(batch_size)[:, None, None] * num_atoms + u[:, :, None]
-            weights_u = target_probs[:, :, None] * (b[:, :, None] - l.astype(jnp.float32)[:, :, None])
+            # Distribute probability mass using linear interpolation
+            flat_target = target_dist.flatten()
+            l_indices = (l + offset).flatten()
+            u_indices = (u + offset).flatten()
+            l_weights = (target_probs * (u.astype(jnp.float32) - b)).flatten()
+            u_weights = (target_probs * (b - l.astype(jnp.float32))).flatten()
             
-            target_dist_flat = jnp.zeros(batch_size * num_atoms)
-            target_dist_flat = target_dist_flat.at[indices.flatten()].add(weights_l.flatten())
-            target_dist_flat = target_dist_flat.at[indices_u.flatten()].add(weights_u.flatten())
-            target_dist = target_dist_flat.reshape(batch_size, num_atoms)
+            flat_target = flat_target.at[l_indices].add(l_weights)
+            flat_target = flat_target.at[u_indices].add(u_weights)
+            target_dist = flat_target.reshape(batch_size, self.critic_def.num_atoms)
 
             q1_logits, q2_logits = self.critic.apply_fn(
                 critic_params, batch.obs, batch.action
@@ -246,3 +271,13 @@ class TD3:
             source.params,
         )
         return target.replace(params=new_params)
+        
+    def update_learning_rates(self, actor_lr, critic_lr):
+        """Update learning rates for both actor and critic"""
+        # Create new optimizers with updated learning rates
+        new_actor_tx = optax.adamw(actor_lr, weight_decay=0.1)
+        new_critic_tx = optax.adamw(critic_lr, weight_decay=0.1)
+        
+        # Update the training states with new optimizers
+        self.actor = self.actor.replace(tx=new_actor_tx)
+        self.critic = self.critic.replace(tx=new_critic_tx)

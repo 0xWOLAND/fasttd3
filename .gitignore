@@ -8,3 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Checkpoints
+checkpoint_*.pkl
+
+# Log files
+*.txt
+*.png

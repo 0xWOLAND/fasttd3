@@ -10,5 +10,6 @@ dependencies = [
     "gymnasium[mujoco]>=1.2.0",
     "jax[cuda12]>=0.6.2",
     "jaxlib>=0.6.2",
+    "matplotlib>=3.10.5",
     "optax>=0.2.5",
 ]
