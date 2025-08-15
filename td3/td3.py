@@ -139,10 +139,6 @@ class TD3:
         self.support = jnp.linspace(
             critic_def.v_min, critic_def.v_max, critic_def.num_atoms
         )
-        
-        # Store initial learning rates for scheduling
-        self.initial_actor_lr = actor_lr
-        self.initial_critic_lr = critic_lr
 
     def select_action(self, obs, add_noise=False):
         obs = jnp.asarray(obs)
@@ -156,19 +152,8 @@ class TD3:
         return jnp.clip(action, -self.max_action, self.max_action)
 
     def train_batch(self, batch):
-        """Train on a pre-sampled and pre-processed batch"""
         self.total_it += 1
         self.rng, noise_key = jax.random.split(self.rng)
-        self._train_on_batch(batch, noise_key)
-        
-    def train(self, replay_buffer, batch_size):
-        """Original train method for backward compatibility"""
-        self.total_it += 1
-        self.rng, sample_key, noise_key = jax.random.split(self.rng, 3)
-        batch = replay_buffer.sample(sample_key, batch_size)
-        self._train_on_batch(batch, noise_key)
-        
-    def _train_on_batch(self, batch, noise_key):
 
         def value_from_logits(logits):
             probs = nn.softmax(logits, axis=-1)
@@ -271,13 +256,3 @@ class TD3:
             source.params,
         )
         return target.replace(params=new_params)
-        
-    def update_learning_rates(self, actor_lr, critic_lr):
-        """Update learning rates for both actor and critic"""
-        # Create new optimizers with updated learning rates
-        new_actor_tx = optax.adamw(actor_lr, weight_decay=0.1)
-        new_critic_tx = optax.adamw(critic_lr, weight_decay=0.1)
-        
-        # Update the training states with new optimizers
-        self.actor = self.actor.replace(tx=new_actor_tx)
-        self.critic = self.critic.replace(tx=new_critic_tx)
