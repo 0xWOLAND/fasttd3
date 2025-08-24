@@ -95,14 +95,16 @@ class TD3:
         policy_noise=0.2,
         noise_clip=0.5,
         policy_freq=2,
+        num_updates=1,
         seed=0,
     ):
         self.max_action = max_action
         self.discount = discount
         self.tau = tau
-        self.policy_noise = policy_noise
-        self.noise_clip = noise_clip
+        self.policy_noise = policy_noise  # Keep as ratio
+        self.noise_clip = noise_clip  # Keep as ratio
         self.policy_freq = policy_freq
+        self.num_updates = num_updates
         self.total_it = 0
         self.num_envs = num_envs
 
@@ -148,63 +150,75 @@ class TD3:
             
         return jnp.clip(action, -self.max_action, self.max_action)
 
-    def train(self, replay_buffer, batch_size):
-        self.total_it += 1
-        self.rng, sample_key, noise_key = jax.random.split(self.rng, 3)
-        batch = replay_buffer.sample(sample_key, batch_size)
-
+    def _compute_critic_loss(self, critic_params, target_critic_params, actor_target_params, batch, noise_key):
         def value_from_logits(logits):
             probs = nn.softmax(logits, axis=-1)
             return jnp.sum(probs * self.support, axis=-1)
 
-        def critic_loss_fn(critic_params):
-            next_action = self.actor_target.apply_fn(
-                self.actor_target.params, batch.next_obs
+        next_action = self.actor_target.apply_fn(actor_target_params, batch.next_obs)
+        # Target policy smoothing with properly scaled noise
+        noise = jax.random.normal(noise_key, next_action.shape) * self.policy_noise * self.max_action
+        noise = jnp.clip(noise, -self.noise_clip * self.max_action, self.noise_clip * self.max_action)
+        next_action = jnp.clip(
+            next_action + noise, -self.max_action, self.max_action
+        )
+
+        target_q1_logits, target_q2_logits = self.critic_target.apply_fn(
+            target_critic_params, batch.next_obs, next_action
+        )
+        target_q1 = value_from_logits(target_q1_logits)
+        target_q2 = value_from_logits(target_q2_logits)
+        target_q = jnp.minimum(target_q1, target_q2)
+        target_q = batch.reward + (1.0 - batch.done) * (self.discount ** batch.effective_n) * target_q
+
+        q1_logits, q2_logits = self.critic.apply_fn(
+            critic_params, batch.obs, batch.action
+        )
+        q1 = value_from_logits(q1_logits)
+        q2 = value_from_logits(q2_logits)
+
+        loss = ((q1 - target_q) ** 2 + (q2 - target_q) ** 2).mean()
+        return loss
+
+    def _compute_actor_loss(self, actor_params, critic_params, batch):
+        def value_from_logits(logits):
+            probs = nn.softmax(logits, axis=-1)
+            return jnp.sum(probs * self.support, axis=-1)
+
+        actions = self.actor.apply_fn(actor_params, batch.obs)
+        q1_logits, _ = self.critic.apply_fn(
+            critic_params, batch.obs, actions
+        )
+        q1 = value_from_logits(q1_logits)
+        return -q1.mean()
+
+    def train(self, replay_buffer, batch_size):
+        for _ in range(self.num_updates):
+            self.total_it += 1
+            self.rng, sample_key, noise_key = jax.random.split(self.rng, 3)
+            batch = replay_buffer.sample(sample_key, batch_size)
+
+            def critic_loss_fn(critic_params):
+                return self._compute_critic_loss(critic_params, self.critic_target.params, 
+                                               self.actor_target.params, batch, noise_key)
+            
+            critic_grads = jax.grad(critic_loss_fn)(self.critic.params)
+            self.critic = self.critic.apply_gradients(grads=critic_grads)
+            
+            should_update_actor = (
+                (self.num_updates > 1 and _ % self.policy_freq == 1) or
+                (self.num_updates == 1 and self.total_it % self.policy_freq == 0)
             )
-            noise = jnp.clip(
-                jax.random.normal(noise_key, next_action.shape) * self.policy_noise,
-                -self.noise_clip,
-                self.noise_clip,
-            )
-            next_action = jnp.clip(
-                next_action + noise, -self.max_action, self.max_action
-            )
+            
+            if should_update_actor:
+                def actor_loss_fn(actor_params):
+                    return self._compute_actor_loss(actor_params, self.critic.params, batch)
+                
+                actor_grads = jax.grad(actor_loss_fn)(self.actor.params)
+                self.actor = self.actor.apply_gradients(grads=actor_grads)
 
-            target_q1_logits, target_q2_logits = self.critic_target.apply_fn(
-                self.critic_target.params, batch.next_obs, next_action
-            )
-            target_q1 = value_from_logits(target_q1_logits)
-            target_q2 = value_from_logits(target_q2_logits)
-            target_q = jnp.minimum(target_q1, target_q2)
-            target_q = batch.reward + (1.0 - batch.done) * (self.discount ** batch.effective_n) * target_q
-
-            q1_logits, q2_logits = self.critic.apply_fn(
-                critic_params, batch.obs, batch.action
-            )
-            q1 = value_from_logits(q1_logits)
-            q2 = value_from_logits(q2_logits)
-
-            loss = ((q1 - target_q) ** 2 + (q2 - target_q) ** 2).mean()
-            return loss
-
-        critic_grads = jax.grad(critic_loss_fn)(self.critic.params)
-        self.critic = self.critic.apply_gradients(grads=critic_grads)
-
-        if self.total_it % self.policy_freq == 0:
-
-            def actor_loss_fn(actor_params):
-                actions = self.actor.apply_fn(actor_params, batch.obs)
-                q1_logits, _ = self.critic.apply_fn(
-                    self.critic.params, batch.obs, actions
-                )
-                q1 = value_from_logits(q1_logits)
-                return -q1.mean()
-
-            actor_grads = jax.grad(actor_loss_fn)(self.actor.params)
-            self.actor = self.actor.apply_gradients(grads=actor_grads)
-
-            self.actor_target = self._soft_update(self.actor_target, self.actor)
-            self.critic_target = self._soft_update(self.critic_target, self.critic)
+                self.actor_target = self._soft_update(self.actor_target, self.actor)
+                self.critic_target = self._soft_update(self.critic_target, self.critic)
 
     def _soft_update(self, target: TrainState, source: TrainState):
         new_params = jax.tree_util.tree_map(
