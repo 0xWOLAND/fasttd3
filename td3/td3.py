@@ -196,15 +196,9 @@ class TD3:
         for _ in range(self.num_updates):
             self.total_it += 1
             self.rng, sample_key, noise_key = jax.random.split(self.rng, 3)
-            # Sample on CPU, move to GPU
-            with jax.default_device(jax.devices('cpu')[0]):
-                batch = replay_buffer.sample(sample_key, batch_size)
-            batch = jax.tree.map(lambda x: jax.device_put(x, jax.devices('gpu')[0]), batch)
+            batch = replay_buffer.sample(sample_key, batch_size)
 
-            def critic_loss_fn(critic_params):
-                return self._compute_critic_loss(critic_params, self.critic_target.params, 
-                                               self.actor_target.params, batch, noise_key)
-            
+            critic_loss_fn = jax.jit(lambda p: self._compute_critic_loss(p, self.critic_target.params, self.actor_target.params, batch, noise_key))
             critic_grads = jax.grad(critic_loss_fn)(self.critic.params)
             self.critic = self.critic.apply_gradients(grads=critic_grads)
             
@@ -214,9 +208,7 @@ class TD3:
             )
             
             if should_update_actor:
-                def actor_loss_fn(actor_params):
-                    return self._compute_actor_loss(actor_params, self.critic.params, batch)
-                
+                actor_loss_fn = jax.jit(lambda p: self._compute_actor_loss(p, self.critic.params, batch))
                 actor_grads = jax.grad(actor_loss_fn)(self.actor.params)
                 self.actor = self.actor.apply_gradients(grads=actor_grads)
 

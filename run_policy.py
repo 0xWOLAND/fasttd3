@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 
 # Load saved model
-with open("trained_td3.pkl", "rb") as f:
+with open("halfcheetah_trained_td3.pkl", "rb") as f:
     data = pickle.load(f)
     actor_params = data["actor_params"]
     obs_dim = data["obs_dim"]
