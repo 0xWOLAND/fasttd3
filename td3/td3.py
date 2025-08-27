@@ -196,7 +196,10 @@ class TD3:
         for _ in range(self.num_updates):
             self.total_it += 1
             self.rng, sample_key, noise_key = jax.random.split(self.rng, 3)
-            batch = replay_buffer.sample(sample_key, batch_size)
+            # Sample on CPU, move to GPU
+            with jax.default_device(jax.devices('cpu')[0]):
+                batch = replay_buffer.sample(sample_key, batch_size)
+            batch = jax.tree.map(lambda x: jax.device_put(x, jax.devices('gpu')[0]), batch)
 
             def critic_loss_fn(critic_params):
                 return self._compute_critic_loss(critic_params, self.critic_target.params, 

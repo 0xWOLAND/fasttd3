@@ -1,13 +1,15 @@
+print("Starting imports...")
 import gymnasium as gym
 import numpy as np
+print("Basic imports done...")
 from td3.td3 import TD3, Actor, Critic
 from td3.utils import ReplayBuffer
 import jax
 import time
+print("All imports complete!")
 
 def eval_policy(agent, env_name, seed, eval_episodes=10):
     """Evaluate the policy for a given number of episodes."""
-    # Use vectorized environments for faster evaluation
     if eval_episodes > 1:
         eval_envs = gym.make_vec(env_name, num_envs=min(eval_episodes, 4))
         num_envs = eval_envs.num_envs
@@ -65,21 +67,21 @@ agent = TD3(
     action_dim=act_dim,
     max_action=max_action,
     actor_def=Actor(obs_dim, act_dim, max_action, hidden_dim=256),
-    critic_def=Critic(obs_dim, act_dim, num_atoms=51, hidden_dim=256, v_min=-2000, v_max=2000),
+    critic_def=Critic(obs_dim, act_dim, num_atoms=32, hidden_dim=256, v_min=-500, v_max=6000),
     num_envs=num_envs,
-    num_updates=num_updates,
+    num_updates=1,  # Reduce updates
     tau=0.005,
-    policy_noise=0.2,  # Standard TD3 noise
-    noise_clip=0.5,    # Standard TD3 clip
+    policy_noise=0.2,
+    noise_clip=0.5,
     actor_lr=3e-4,
     critic_lr=3e-4,
 )
 
-rb = ReplayBuffer(obs_dim, act_dim, size=10_000, n_env=num_envs, n_steps=n_steps, gamma=0.99)
+rb = ReplayBuffer(obs_dim, act_dim, size=100_000, n_env=num_envs, n_steps=n_steps, gamma=0.99)
 
-start_timesteps = 2000  
+start_timesteps = 10_000  
 eval_freq = 5000  
-max_timesteps = 20_000  
+max_timesteps = 200_000  
 batch_size = 256
 seed = 0
 
