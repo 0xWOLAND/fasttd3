@@ -10,33 +10,46 @@ import time
 from jax import profiler
 print("All imports complete!")
 
+# Enable JAX persistent compilation cache
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_compilation_cache")
 
-def eval_policy(agent, env, seed, eval_episodes=3):
-    num_parallel = env.batch_size  
+
+def eval_policy(agent, env_name, seed, eval_episodes=3):
+    """Fast eval using single environment for clean evaluation"""
+    # Create single environment for evaluation with same config as training
+    eval_env = envs.create(
+        env_name=env_name,
+        episode_length=1000,
+        action_repeat=1,
+        auto_reset=True,
+        batch_size=1,  # Single environment for eval
+        backend="mjx"
+    )
     
-    rng = jax.random.PRNGKey(seed)
-    rng, reset_key = jax.random.split(rng)
-    state = env.reset(reset_key)
-    episode_rewards = jnp.zeros(num_parallel)
-    completed_episodes = []
+    episode_rewards = []
     
-    while len(completed_episodes) < eval_episodes:
-        actions = agent.select_action(state.obs, add_noise=False)
-        state = env.step(state, actions)
-        episode_rewards += state.reward
+    for ep in range(eval_episodes):
+        rng = jax.random.PRNGKey(seed + ep)
+        rng, reset_key = jax.random.split(rng)
+        state = eval_env.reset(reset_key)
+        episode_reward = 0.0
         
-        if state.done.any():
-            done_indices = jnp.where(state.done)[0]
-            for idx in done_indices:
-                if len(completed_episodes) < eval_episodes:
-                    completed_episodes.append(float(episode_rewards[idx]))
-            episode_rewards = jnp.where(state.done, 0.0, episode_rewards)
-    
-    return float(jnp.mean(jnp.array(completed_episodes)))
+        for i in range(1000):
+            actions = agent.select_action(state.obs, noise_scale=0.0)
+            state = eval_env.step(state, actions)
+            episode_reward += float(state.reward[0])
 
-num_envs = 2  # Reduce to test if memory/batch size is the issue
+            if state.done[0]:
+                break
+            
+        episode_rewards.append(episode_reward)
+    
+    return float(jnp.mean(jnp.array(episode_rewards)))
+
+num_envs = 2 
+env_name = "humanoid"
 env = envs.create(
-    env_name="humanoid",
+    env_name=env_name,
     episode_length=1000,
     action_repeat=1,
     auto_reset=True,
@@ -44,27 +57,29 @@ env = envs.create(
     backend="mjx"
 )
 
-obs_dim = env.observation_size
-act_dim = env.action_size
+
 max_action = 1.0
 
-n_steps = 3  
-num_updates = 2 
-
 agent = TD3(
-    state_dim=obs_dim,
-    action_dim=act_dim,
+    state_dim=env.observation_size,
+    action_dim=env.action_size,
     max_action=max_action,
-    actor_def=Actor(obs_dim, act_dim, max_action, hidden_dim=256),
-    critic_def=Critic(obs_dim, act_dim, num_atoms=32, hidden_dim=256, v_min=-1000, v_max=7000),
+    actor_def=Actor(env.observation_size, env.action_size, max_action, hidden_dim=256),
+    critic_def=Critic(env.observation_size, env.action_size, num_atoms=32, hidden_dim=256, v_min=-1000, v_max=7000),
     num_envs=num_envs,
-    num_updates=1,  # Reduce updates
+    num_updates=1,
     tau=0.005,
     policy_noise=0.2,
     noise_clip=0.5,
     actor_lr=3e-4,
     critic_lr=3e-4,
 )
+
+obs_dim = env.observation_size
+act_dim = env.action_size
+
+n_steps = 3  
+num_updates = 2
 
 rb = ReplayBuffer(obs_dim, act_dim, size=100_000, n_env=num_envs, n_steps=n_steps, gamma=0.99)
 
@@ -88,15 +103,16 @@ eval_rewards_tracker = []
 
 # Evaluate untrained policy
 print("# Evaluating initial policy...")
-initial_eval = eval_policy(agent, env, seed, eval_episodes=3)
+initial_eval = eval_policy(agent, seed, eval_episodes=3)
 print(f"0,0.0,{initial_eval:.2f},0,0.00")
 
 # Initialize training
-print("# Resetting environments...")
 rng = jax.random.PRNGKey(seed)
 rng, reset_key = jax.random.split(rng)
 state = env.reset(reset_key)
 print("# Starting training loop...")
+
+profiler.start_trace("/tmp/jax_trace")
 
 for t in range(max_timesteps):
     print(f'{t}/{max_timesteps}')
@@ -108,26 +124,32 @@ for t in range(max_timesteps):
     elif t == start_timesteps:
         print(f"# Training phase started at step {t+1}")
     
-    # Select actions for all environments
-    if t < start_timesteps:
-        # Random exploration
-        rng, action_key = jax.random.split(rng)
-        actions = jax.random.uniform(action_key, (num_envs, act_dim), minval=-max_action, maxval=max_action)
-    else:
-        # Policy with exploration noise
-        actions = agent.select_action(state.obs, add_noise=True)
+    with profiler.StepTraceAnnotation("step", step_num=t):
+        # Select actions for all environments
+        if t < start_timesteps:
+            # Random exploration
+            rng, action_key = jax.random.split(rng)
+            actions = jax.random.uniform(action_key, (num_envs, act_dim), minval=-max_action, maxval=max_action)
+        else:
+            # Policy with exploration noise
+            actions = agent.select_action(state.obs, noise_scale=0.1)
+        
+        # Step environments (auto-reset handles done environments)
+        state = env.step(state, actions)
+        
+        # Add to replay buffer - keep on GPU (no CPU conversion)
+        rb.add(
+            state.obs, 
+            actions, 
+            state.obs,  # With auto-reset, obs is already "next_obs"
+            state.reward, 
+            state.done.astype(float)
+        )
     
-    # Step environments (auto-reset handles done environments)
-    state = env.step(state, actions)
-    
-    # Add to replay buffer - keep on GPU (no CPU conversion)
-    rb.add(
-        state.obs, 
-        actions, 
-        state.obs,  # With auto-reset, obs is already "next_obs"
-        state.reward, 
-        state.done.astype(float)
-    )
+    if t == 10:  # Stop profiling after 10 steps to analyze
+        profiler.stop_trace()
+        print(f"# Profiling trace saved to /tmp/jax_trace - check with: tensorboard --logdir /tmp/jax_trace")
+        break
     
     # Train agent after collecting sufficient data
     min_buffer_size = max(batch_size * 2, 1000)  
@@ -135,35 +157,21 @@ for t in range(max_timesteps):
         agent.train(rb, batch_size=batch_size)
     
     if (t + 1) % 1000 == 0:
-        if recent_episode_rewards:
-            avg_recent = np.mean(recent_episode_rewards[-10:])  # Last 10 episodes
-        else:
-            avg_recent = 0.0
-        
         wall_time = time.time() - start_time
         is_training = "T" if t >= start_timesteps else "E"  # T=training, E=exploring
-        print(f"{t+1},{avg_recent:.2f},0.0,{episodes_completed},{wall_time:.2f},{is_training}")
+        print(f"{t+1},0.0,0.0,0,{wall_time:.2f},{is_training}")
     
     if (t + 1) % eval_freq == 0:
-        eval_reward = eval_policy(agent, env, seed, eval_episodes=3)
+        eval_reward = eval_policy(agent, seed, eval_episodes=3)
         wall_time = time.time() - start_time
         
-        if recent_episode_rewards:
-            avg_recent = np.mean(recent_episode_rewards[-10:])
-        else:
-            avg_recent = 0.0
-        
-        print(f"{t+1},{avg_recent:.2f},{eval_reward:.2f},{episodes_completed},{wall_time:.2f}")
+        print(f"{t+1},0.0,{eval_reward:.2f},0,{wall_time:.2f}")
 
-final_eval = eval_policy(agent, env, seed, eval_episodes=5)
+final_eval = eval_policy(agent, seed, eval_episodes=5)
 wall_time = time.time() - start_time
-if recent_episode_rewards:
-    avg_recent = np.mean(recent_episode_rewards[-10:])
-else:
-    avg_recent = 0.0
 
-print(f"{max_timesteps},{avg_recent:.2f},{final_eval:.2f},{episodes_completed},{wall_time:.2f}")
-print(f"# Training complete! Final eval: {final_eval:.2f}, Episodes: {episodes_completed}")
+print(f"{max_timesteps},0.0,{final_eval:.2f},0,{wall_time:.2f}")
+print(f"# Training complete! Final eval: {final_eval:.2f}")
 
 # Save the trained model
 import pickle

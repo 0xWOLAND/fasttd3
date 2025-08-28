@@ -139,14 +139,12 @@ class TD3:
             critic_def.v_min, critic_def.v_max, critic_def.num_atoms
         )
 
-    def select_action(self, obs, add_noise=False):
-        obs = jnp.asarray(obs)
+    def select_action(self, obs, noise_scale=0.0):
         action = self.actor.apply_fn(self.actor.params, obs)
         
-        if add_noise:
-            self.rng, noise_key = jax.random.split(self.rng)
-            noise = jax.random.normal(noise_key, action.shape) * 0.1 * self.max_action
-            action = action + noise
+        self.rng, noise_key = jax.random.split(self.rng)
+        noise = jax.random.normal(noise_key, action.shape) * noise_scale * self.max_action
+        action = action + noise
             
         return jnp.clip(action, -self.max_action, self.max_action)
 

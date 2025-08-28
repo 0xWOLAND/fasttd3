@@ -5,11 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "brax>=0.12.4", 
+    "brax>=0.12.4",
     "flax>=0.10.7",
     "jax[cuda12]>=0.6.2",
     "jaxlib[cuda12]>=0.6.2",
     "optax>=0.2.5",
     "mujoco>=3.0.0",
     "mujoco-mjx>=3.0.0",
+    "playground>=0.0.5",
 ]
