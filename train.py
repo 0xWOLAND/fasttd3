@@ -1,61 +1,49 @@
-import gymnasium as gym
+import mujoco_playground
+from mujoco_playground import registry
 import numpy as np
+import jax
+import jax.numpy as jnp
 from td3.td3 import TD3, Actor, Critic
 from td3.utils import ReplayBuffer
-import jax
 import time
 
 def eval_policy(agent, env_name, seed, eval_episodes=10):
     """Evaluate the policy for a given number of episodes."""
-    # Use vectorized environments for faster evaluation
-    if eval_episodes > 1:
-        eval_envs = gym.make_vec(env_name, num_envs=min(eval_episodes, 4))
-        num_envs = eval_envs.num_envs
-        episodes_per_env = (eval_episodes + num_envs - 1) // num_envs
-        
-        total_rewards = []
-        obs, _ = eval_envs.reset(seed=seed)
-        episode_rewards = np.zeros(num_envs)
-        episodes_completed = np.zeros(num_envs, dtype=int)
-        
-        while np.any(episodes_completed < episodes_per_env):
-            # Get actions for all environments at once
-            actions = np.asarray(agent.select_action(obs))
-            obs, rewards, terminated, truncated, _ = eval_envs.step(actions)
-            dones = terminated | truncated
-            
-            # Update rewards
-            episode_rewards += rewards
-            
-            # Handle completed episodes
-            if np.any(dones):
-                for idx in np.where(dones)[0]:
-                    if episodes_completed[idx] < episodes_per_env:
-                        total_rewards.append(episode_rewards[idx])
-                        episode_rewards[idx] = 0
-                        episodes_completed[idx] += 1
-        
-        return np.mean(total_rewards[:eval_episodes])
-    else:
-        # Single episode evaluation
-        eval_env = gym.make(env_name)
-        obs, _ = eval_env.reset(seed=seed)
+    eval_env_cfg = registry.get_default_config(env_name)
+    eval_env = registry.load(env_name, config=eval_env_cfg)
+    jit_eval_reset = jax.jit(eval_env.reset)
+    jit_eval_step = jax.jit(eval_env.step)
+    
+    total_reward = 0
+    for i in range(eval_episodes):
+        rng = jax.random.PRNGKey(seed + i)
+        state = jit_eval_reset(rng)
         episode_reward = 0
-        done = False
-        while not done:
-            action = np.asarray(agent.select_action(obs[None]))[0]
-            obs, reward, terminated, truncated, _ = eval_env.step(action)
-            episode_reward += reward
-            done = terminated or truncated
-        return episode_reward
+        while not state.done:
+            flat_obs = flatten_obs(state.obs)
+            action = agent.select_action(np.array(flat_obs)[None])[0]
+            state = jit_eval_step(state, action)
+            episode_reward += state.reward
+        total_reward += episode_reward
+    return total_reward / eval_episodes
 
-# Create environments
-num_envs = 8 
-envs = gym.make_vec("HalfCheetah-v5", num_envs=num_envs)
-env = gym.make("HalfCheetah-v5")
-obs_dim = env.observation_space.shape[0]
-act_dim = env.action_space.shape[0]
-max_action = float(env.action_space.high[0])
+# Create environment
+num_envs = 8
+env_name = "G1JoystickFlatTerrain"
+env_cfg = registry.get_default_config(env_name) 
+env = registry.load(env_name, config=env_cfg)
+# Flatten observation space for nested obs
+dummy_state = env.reset(jax.random.PRNGKey(0))
+if isinstance(dummy_state.obs, dict):
+    obs_dim = sum(obs.shape[0] for obs in dummy_state.obs.values())
+else:
+    obs_dim = env.observation_size
+act_dim = env.action_size
+max_action = 1.0
+
+# JIT compile environment functions for performance
+jit_reset = jax.jit(env.reset)
+jit_step = jax.jit(env.step)
 
 n_steps = 3  
 num_updates = 2 
@@ -85,7 +73,7 @@ seed = 0
 
 print("# FastTD3 Training")
 print(f"# Config: envs={num_envs}, n_steps={n_steps}, num_updates={num_updates}, batch_size={batch_size}")
-print(f"# Episode length: 1000 steps (HalfCheetah-v5)")
+print(f"# Episode length: 1000 steps ({env_name})")
 print(f"# Columns: timestep,episode_reward,eval_reward,episodes_completed,wall_time,phase")
 print("# Data:")
 
@@ -95,39 +83,60 @@ episode_rewards_tracker = []
 eval_rewards_tracker = []
 
 # Evaluate untrained policy
-initial_eval = eval_policy(agent, "HalfCheetah-v5", seed, eval_episodes=3)
+initial_eval = eval_policy(agent, env_name, seed, eval_episodes=3)
 print(f"0,0.0,{initial_eval:.2f},0,0.00")
 
-# Initialize training
-obs, _ = envs.reset()
+# Helper to flatten observations
+def flatten_obs(obs):
+    if isinstance(obs, dict):
+        return jnp.concatenate([obs[k] for k in sorted(obs.keys())], axis=-1)
+    return obs
+
+# Initialize training - vectorized environments
+rng_keys = jax.random.split(jax.random.PRNGKey(seed), num_envs)
+states = jax.vmap(jit_reset)(rng_keys)
+obs = jax.vmap(flatten_obs)(states.obs)
 episode_rewards = np.zeros(num_envs)
-episode_timesteps = np.zeros(num_envs)
+episode_timesteps = np.zeros(num_envs) 
 episodes_completed = 0
 recent_episode_rewards = []
-
-actions = np.zeros((num_envs, act_dim), dtype=np.float32)
 
 for t in range(max_timesteps):
     episode_timesteps += 1
     
     # Select actions for all environments
     if t < start_timesteps:
-        # Random exploration (vectorized)
-        actions[:] = jax.random.uniform(agent.rng, (num_envs, act_dim), minval=-max_action, maxval=max_action)
-        agent.rng, _ = jax.random.split(agent.rng)
+        # Random exploration
+        agent.rng, action_key = jax.random.split(agent.rng)
+        actions = jax.random.uniform(action_key, (num_envs, act_dim), minval=-max_action, maxval=max_action)
     else:
-        # Policy with exploration noise (already vectorized)
-        actions[:] = agent.select_action(obs, add_noise=True)
+        # Policy with exploration noise
+        actions = agent.select_action(np.array(obs), add_noise=True)
     
-    # Step all environments
-    next_obs, rewards, terminated, truncated, _ = envs.step(actions)
-    dones = terminated | truncated
-    episode_rewards += rewards
+    # Step all environments (vectorized)
+    next_states = jax.vmap(jit_step)(states, actions)
+    next_obs = jax.vmap(flatten_obs)(next_states.obs)
+    rewards = next_states.reward
+    dones = next_states.done
     
-    # Handle episode termination vs truncation for proper done_bool
-    done_bools = terminated.astype(float)
+    episode_rewards += np.array(rewards)
     
-    rb.add(obs, actions, next_obs, rewards, done_bools)
+    # Add to replay buffer
+    rb.add(obs, actions, next_obs, rewards, dones.astype(float))
+    
+    # Reset finished environments (vectorized)
+    num_resets = jnp.sum(dones)
+    if num_resets > 0:
+        agent.rng, reset_rng = jax.random.split(agent.rng)
+        reset_keys = jax.random.split(reset_rng, num_envs)
+        reset_states = jax.vmap(jit_reset)(reset_keys)
+        next_states = jax.tree_map(
+            lambda new, old, mask: jnp.where(mask[..., None], new, old),
+            reset_states, next_states, dones
+        )
+    
+    states = next_states
+    obs = next_obs
     
     if np.any(dones):
         finished_episodes = np.where(dones)[0]
@@ -154,7 +163,7 @@ for t in range(max_timesteps):
         print(f"{t+1},{avg_recent:.2f},0.0,{episodes_completed},{wall_time:.2f},{is_training}")
     
     if (t + 1) % eval_freq == 0:
-        eval_reward = eval_policy(agent, "HalfCheetah-v5", seed, eval_episodes=3)
+        eval_reward = eval_policy(agent, env_name, seed, eval_episodes=3)
         wall_time = time.time() - start_time
         
         if recent_episode_rewards:
@@ -164,7 +173,7 @@ for t in range(max_timesteps):
         
         print(f"{t+1},{avg_recent:.2f},{eval_reward:.2f},{episodes_completed},{wall_time:.2f}")
 
-final_eval = eval_policy(agent, "HalfCheetah-v5", seed, eval_episodes=5)
+final_eval = eval_policy(agent, env_name, seed, eval_episodes=5)
 wall_time = time.time() - start_time
 if recent_episode_rewards:
     avg_recent = np.mean(recent_episode_rewards[-10:])
