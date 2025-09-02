@@ -7,6 +7,12 @@ from td3.td3 import TD3, Actor, Critic
 from td3.utils import ReplayBuffer
 import time
 
+# Helper to flatten observations
+def flatten_obs(obs):
+    if isinstance(obs, dict):
+        return jnp.concatenate([obs[k] for k in sorted(obs.keys())], axis=-1)
+    return obs
+
 def eval_policy(agent, env_name, seed, eval_episodes=10):
     """Evaluate the policy for a given number of episodes."""
     eval_env_cfg = registry.get_default_config(env_name)
@@ -27,9 +33,9 @@ def eval_policy(agent, env_name, seed, eval_episodes=10):
         total_reward += episode_reward
     return total_reward / eval_episodes
 
-# Create environment
-num_envs = 8
+num_envs = 1
 env_name = "G1JoystickFlatTerrain"
+# env_name = "CheetahRun"
 env_cfg = registry.get_default_config(env_name) 
 env = registry.load(env_name, config=env_cfg)
 # Flatten observation space for nested obs
@@ -65,10 +71,10 @@ agent = TD3(
 
 rb = ReplayBuffer(obs_dim, act_dim, size=10_000, n_env=num_envs, n_steps=n_steps, gamma=0.99)
 
-start_timesteps = 2000  
+start_timesteps = 1000  
 eval_freq = 5000  
-max_timesteps = 20_000  
-batch_size = 256
+max_timesteps = 5_000  
+batch_size = 64
 seed = 0
 
 print("# FastTD3 Training")
@@ -82,106 +88,67 @@ start_time = time.time()
 episode_rewards_tracker = []
 eval_rewards_tracker = []
 
-# Evaluate untrained policy
-initial_eval = eval_policy(agent, env_name, seed, eval_episodes=3)
-print(f"0,0.0,{initial_eval:.2f},0,0.00")
-
-# Helper to flatten observations
-def flatten_obs(obs):
-    if isinstance(obs, dict):
-        return jnp.concatenate([obs[k] for k in sorted(obs.keys())], axis=-1)
-    return obs
-
-# Initialize training - vectorized environments
-rng_keys = jax.random.split(jax.random.PRNGKey(seed), num_envs)
-states = jax.vmap(jit_reset)(rng_keys)
-obs = jax.vmap(flatten_obs)(states.obs)
+# Initialize training - single environment (no vectorization)
+rng = jax.random.PRNGKey(seed)
+state = jit_reset(rng)
+obs = flatten_obs(state.obs)[None]  # Add batch dimension
+states = [state]  # Keep as list for compatibility
 episode_rewards = np.zeros(num_envs)
-episode_timesteps = np.zeros(num_envs) 
 episodes_completed = 0
 recent_episode_rewards = []
-
 for t in range(max_timesteps):
-    episode_timesteps += 1
-    
-    # Select actions for all environments
+    # Select actions
     if t < start_timesteps:
-        # Random exploration
         agent.rng, action_key = jax.random.split(agent.rng)
         actions = jax.random.uniform(action_key, (num_envs, act_dim), minval=-max_action, maxval=max_action)
     else:
-        # Policy with exploration noise
         actions = agent.select_action(np.array(obs), add_noise=True)
     
-    # Step all environments (vectorized)
-    next_states = jax.vmap(jit_step)(states, actions)
-    next_obs = jax.vmap(flatten_obs)(next_states.obs)
-    rewards = next_states.reward
-    dones = next_states.done
-    
+    # Step single environment
+    next_state = jit_step(states[0], actions[0])
+    next_obs = flatten_obs(next_state.obs)[None]  # Add batch dimension
+    rewards = jnp.array([next_state.reward])
+    dones = jnp.array([next_state.done])
     episode_rewards += np.array(rewards)
     
-    # Add to replay buffer
+    # Add to buffer
     rb.add(obs, actions, next_obs, rewards, dones.astype(float))
     
-    # Reset finished environments (vectorized)
-    num_resets = jnp.sum(dones)
-    if num_resets > 0:
+    # Reset environment if done
+    if dones[0]:
         agent.rng, reset_rng = jax.random.split(agent.rng)
-        reset_keys = jax.random.split(reset_rng, num_envs)
-        reset_states = jax.vmap(jit_reset)(reset_keys)
-        next_states = jax.tree_map(
-            lambda new, old, mask: jnp.where(mask[..., None], new, old),
-            reset_states, next_states, dones
-        )
+        next_state = jit_reset(reset_rng)
+        episodes_completed += 1
+        recent_episode_rewards.append(episode_rewards[0])
+        episode_rewards = np.array([0.0])
     
-    states = next_states
+    states = [next_state]
     obs = next_obs
     
-    if np.any(dones):
-        finished_episodes = np.where(dones)[0]
-        episodes_completed += len(finished_episodes)
-        recent_episode_rewards.extend(episode_rewards[finished_episodes].tolist())
-        episode_rewards[dones] = 0
-        episode_timesteps[dones] = 0
-    
-    obs = next_obs
-    
-    # Train agent after collecting sufficient data
-    min_buffer_size = max(batch_size * 2, 1000)  
-    if t >= start_timesteps and rb.size > min_buffer_size:
+    # Train agent
+    if t >= start_timesteps and rb.size > max(batch_size * 2, 1000):
         agent.train(rb, batch_size=batch_size)
     
+    # Logging & Checkpointing
     if (t + 1) % 1000 == 0:
-        if recent_episode_rewards:
-            avg_recent = np.mean(recent_episode_rewards[-10:])  # Last 10 episodes
-        else:
-            avg_recent = 0.0
-        
+        avg_recent = np.mean(recent_episode_rewards[-10:]) if recent_episode_rewards else 0.0
         wall_time = time.time() - start_time
-        is_training = "T" if t >= start_timesteps else "E"  # T=training, E=exploring
-        print(f"{t+1},{avg_recent:.2f},0.0,{episodes_completed},{wall_time:.2f},{is_training}")
+        phase = "T" if t >= start_timesteps else "E"
+        print(f"{t+1},{avg_recent:.2f},0.0,{episodes_completed},{wall_time:.2f},{phase}")
+        
+        # Save checkpoint
+        import pickle
+        with open(f"checkpoint_{t+1}.pkl", "wb") as f:
+            pickle.dump({
+                "actor_params": agent.actor.params,
+                "obs_dim": obs_dim, "act_dim": act_dim, "max_action": max_action,
+                "step": t+1, "episodes": episodes_completed
+            }, f)
     
-    if (t + 1) % eval_freq == 0:
-        eval_reward = eval_policy(agent, env_name, seed, eval_episodes=3)
-        wall_time = time.time() - start_time
-        
-        if recent_episode_rewards:
-            avg_recent = np.mean(recent_episode_rewards[-10:])
-        else:
-            avg_recent = 0.0
-        
-        print(f"{t+1},{avg_recent:.2f},{eval_reward:.2f},{episodes_completed},{wall_time:.2f}")
-
-final_eval = eval_policy(agent, env_name, seed, eval_episodes=5)
-wall_time = time.time() - start_time
-if recent_episode_rewards:
-    avg_recent = np.mean(recent_episode_rewards[-10:])
-else:
-    avg_recent = 0.0
-
-print(f"{max_timesteps},{avg_recent:.2f},{final_eval:.2f},{episodes_completed},{wall_time:.2f}")
-print(f"# Training complete! Final eval: {final_eval:.2f}, Episodes: {episodes_completed}")
+    # Skip evaluation during training
+    
+# Training complete
+print(f"# Training complete! Episodes: {episodes_completed}")
 
 # Save the trained model
 import pickle

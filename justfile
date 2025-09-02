@@ -1,5 +1,6 @@
 train:
-    export XLA_PYTHON_CLIENT_PREALLOCATE=false && uv run train.py | tee log_humanoid.txt
+    uv run train.py | tee log_g1.txt
+    # export XLA_PYTHON_CLIENT_PREALLOCATE=false && uv run train.py | tee log_humanoid.txt
 
 train-cpu:
     JAX_PLATFORM_NAME=cpu uv run train.py | tee log_humanoid_cpu.txt
