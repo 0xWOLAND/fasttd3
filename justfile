@@ -1,6 +1,5 @@
-train:
-    uv run train.py | tee -a log_g1.txt
-    # export XLA_PYTHON_CLIENT_PREALLOCATE=false && uv run train.py | tee -a log_humanoid.txt
+train env="CheetahRun":
+    uv run train.py {{env}} | tee -a log_{{env}}.txt
 
 train-cpu:
     JAX_PLATFORM_NAME=cpu uv run train.py | tee log_humanoid_cpu.txt
@@ -8,8 +7,8 @@ train-cpu:
 train-gpu-fast:
     XLA_FLAGS=--xla_gpu_enable_async_collectives=true JAX_TRACEBACK_FILTERING=off uv run train.py | tee log.txt
 
-test:
-    timeout 120 uv run train.py
+list-envs:
+    uv run python -c "from mujoco_playground import registry; [print(env) for env in registry.ALL_ENVS]"
 
 kill:
     pkill -f train.py || true

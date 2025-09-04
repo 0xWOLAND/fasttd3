@@ -9,6 +9,8 @@ import time
 import pickle
 import os
 import uuid
+import tomllib
+import argparse
 
 # Helper to flatten observations
 def flatten_obs(obs):
@@ -36,38 +38,63 @@ def eval_policy(agent, env_name, seed, eval_episodes=3):
         total_reward += episode_reward
     return total_reward / eval_episodes
 
-# Configuration
-num_envs = 256
-# env_name = "G1JoystickFlatTerrain"
-env_name = "CheetahRun"
-seed = 0
-start_timesteps = 10
-eval_freq = 5000
-max_timesteps = 50_000
-batch_size = 16384
+parser = argparse.ArgumentParser()
+parser.add_argument("env", nargs="?", default="CheetahRun", help="Environment name")
+env_name = parser.parse_args().env
+with open("config.toml", "rb") as f:
+    cfg = tomllib.load(f)[env_name]
+
+num_envs = cfg["num_envs"]
+seed = cfg["seed"]
+start_timesteps = cfg["start_timesteps"]
+eval_freq = cfg["eval_freq"]
+max_timesteps = cfg["max_timesteps"]
+batch_size = cfg["batch_size"]
+tau = cfg["tau"]
+policy_noise = cfg["policy_noise"]
+noise_clip = cfg["noise_clip"]
+actor_lr = cfg["actor_lr"]
+critic_lr = cfg["critic_lr"]
+actor_hidden = cfg["actor_hidden"]
+critic_hidden = cfg["critic_hidden"]
+num_atoms = cfg["num_atoms"]
+v_min = cfg["v_min"]
+v_max = cfg["v_max"]
+num_updates = cfg["num_updates"]
+buffer_size = cfg["buffer_size"]
+n_steps = cfg["n_steps"]
+gamma = cfg["gamma"]
 
 # Setup environment
 env_cfg = registry.get_default_config(env_name)
 env = registry.load(env_name, config=env_cfg)
-dummy_state = env.reset(jax.random.PRNGKey(0))
-obs_dim = sum(obs.shape[0] for obs in dummy_state.obs.values()) if isinstance(dummy_state.obs, dict) else env.observation_size
+
+print(f"env.observation_size: {env.observation_size}", flush=True)
+print(f"env.action_size: {env.action_size}", flush=True)
+
+obs_dim = env.observation_size
 act_dim = env.action_size
 max_action = 1.0
 
+print("Creating JIT functions...", flush=True)
 jit_reset = jax.jit(env.reset)
 jit_step = jax.jit(env.step) 
 
 # Create agent
+print("Creating TD3 agent...", flush=True)
 agent = TD3(
     state_dim=obs_dim, action_dim=act_dim, max_action=max_action,
-    actor_def=Actor(obs_dim, act_dim, max_action, hidden_dim=512),
-    critic_def=Critic(obs_dim, act_dim, num_atoms=101, hidden_dim=1024, v_min=-10.0, v_max=10.0),
-    num_envs=num_envs, num_updates=2,
-    tau=0.1, policy_noise=0.001, noise_clip=0.5,
-    actor_lr=3e-5, critic_lr=3e-5
+    actor_def=Actor(obs_dim, act_dim, max_action, hidden_dim=actor_hidden),
+    critic_def=Critic(obs_dim, act_dim, num_atoms=num_atoms, hidden_dim=critic_hidden, v_min=v_min, v_max=v_max),
+    num_envs=num_envs, num_updates=num_updates,
+    tau=tau, policy_noise=policy_noise, noise_clip=noise_clip,
+    actor_lr=actor_lr, critic_lr=critic_lr
 )
+print("TD3 agent created successfully!", flush=True)
 
-rb = ReplayBuffer(obs_dim, act_dim, size=10240, n_env=num_envs, n_steps=1, gamma=0.97)
+print("Creating replay buffer...", flush=True)
+rb = ReplayBuffer(obs_dim, act_dim, size=buffer_size, n_env=num_envs, n_steps=n_steps, gamma=gamma)
+print("Replay buffer created successfully!", flush=True)
 
 # Create run folder
 run_id = f"{env_name}_{uuid.uuid4().hex[:8]}"
@@ -84,9 +111,9 @@ def save_checkpoint(agent, step, obs_dim, act_dim, max_action, episodes_complete
             "step": step, "episodes": episodes_completed, "eval_reward": eval_reward
         }, f)
     if eval_reward != 0.0:
-        print(f"# Saved: {filename} (eval: {eval_reward:.2f})")
+        print(f"# Saved: {filename} (eval: {eval_reward:.2f})", flush=True)
     else:
-        print(f"# Saved: {filename}")
+        print(f"# Saved: {filename}", flush=True)
 
 print("# FastTD3 Training")
 print(f"# Config: envs={num_envs}, batch_size={batch_size}, eval_freq={eval_freq}")
@@ -95,9 +122,13 @@ print(f"# Columns: timestep,episode_reward,eval_reward,episodes_completed,wall_t
 start_time = time.time()
 
 # Initialize training
+print("Initializing training environments...", flush=True)
 rng_keys = jax.random.split(jax.random.PRNGKey(seed), num_envs)
+print("Resetting environments...", flush=True)
 states = jax.vmap(jit_reset)(rng_keys)
+print("Flattening observations...", flush=True)
 obs = jax.vmap(flatten_obs)(states.obs)
+print("Starting training loop...", flush=True)
 episode_rewards = np.zeros(num_envs)
 episodes_completed = 0
 recent_episode_rewards = []
