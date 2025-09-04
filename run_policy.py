@@ -5,6 +5,12 @@ import pickle
 from td3.td3 import Actor
 import jax
 import jax.numpy as jnp
+
+# Enable persistent compilation cache
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+import os
+# Fix display issues for headless/remote systems
+os.environ['MUJOCO_GL'] = 'egl'  # Use EGL instead of GLX
 import mujoco
 import mujoco.viewer
 import time
@@ -16,18 +22,21 @@ def flatten_obs(obs):
     return obs
 
 # Load saved model
-with open("checkpoint_4000.pkl", "rb") as f:
+with open("checkpoint_7000.pkl", "rb") as f:
     data = pickle.load(f)
     actor_params = data["actor_params"]
     obs_dim = data["obs_dim"]
     act_dim = data["act_dim"]
     max_action = data["max_action"]
 
-actor = Actor(obs_dim, act_dim, max_action, hidden_dim=256)
-env_name = "CheetahRun"
+actor = Actor(obs_dim, act_dim, max_action, hidden_dim=512)
+jit_actor = jax.jit(actor.apply)
+# env_name = "CheetahRun"
+env_name = "G1JoystickFlatTerrain"
 env_cfg = registry.get_default_config(env_name)
 env = registry.load(env_name, config=env_cfg)
 jit_reset, jit_step = jax.jit(env.reset), jax.jit(env.step)
+
 
 print(f"Running trained policy on {env_name} with visualization...")
 
@@ -69,7 +78,7 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
             policy_start = time.time()
             flat_obs = flatten_obs(state.obs)
             obs_jax = jnp.array(flat_obs[None])
-            action = actor.apply(actor_params, obs_jax)[0]
+            action = jit_actor(actor_params, obs_jax)[0]
             action = np.asarray(action)
             policy_time += time.time() - policy_start
             
@@ -87,8 +96,7 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
             data.qpos[:] = state.data.qpos
             data.qvel[:] = state.data.qvel
             data.time = step_count * env.dt
-            # Step MuJoCo physics for visualization
-            mujoco.mj_step(model, data)
+            # Don't step MuJoCo physics - just display JAX state
             viewer.sync()
             viewer_time += time.time() - viewer_start
             

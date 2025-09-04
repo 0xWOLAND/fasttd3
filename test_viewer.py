@@ -7,7 +7,8 @@ from mujoco_playground import registry
 print("Testing MuJoCo viewer with basic physics...")
 
 # Load environment
-env_name = "CheetahRun"
+# env_name = "CheetahRun"
+env_name = "G1JoystickFlatTerrain"
 env_cfg = registry.get_default_config(env_name)
 env = registry.load(env_name, config=env_cfg)
 
